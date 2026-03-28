@@ -7,11 +7,10 @@ import re
 
 app = FastAPI(
     title="XNXX Scraper API V3",
-    description="Unofficial API to search and fetch XNXX videos",
-    version="2.3"
+    version="3.0"
 )
 
-# Enable CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,53 +19,84 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+}
+
+
 @app.get("/")
 async def home():
-    return PlainTextResponse("XNXX Scraper API v3 is running by jsk")
+    return PlainTextResponse("API Running ✅")
 
+
+# =========================
+# 🔍 SEARCH API
+# =========================
 @app.get("/api/search")
 async def search(
-    q: str = Query(..., description="Search query"),
-    page: int = Query(1, description="Page number")
+    q: str = Query(...),
+    page: int = Query(1)
 ):
-    """Scrape search results from txnhh.com (latest mirror)."""
     try:
         base_url = "https://www.txnhh.com"
-        search_url = f"{base_url}/search/fullhd/{q.replace(' ', '+')}/{page}"
-        headers = {"User-Agent": "Mozilla/5.0"}
+        search_url = f"{base_url}/search/{q.replace(' ', '+')}/{page}"
 
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(search_url, headers=headers)
+            r = await client.get(search_url, headers=HEADERS)
+
         soup = BeautifulSoup(r.text, "html.parser")
 
         videos = []
-        for block in soup.select("div.mozaique div.thumb-block"):
-            a_tag = block.select_one("a[href]")
-            img_tag = block.select_one("img")
-            title_tag = block.select_one("p.metadata, p.thumb-under")
 
-            raw_text = title_tag.get_text(strip=True) if title_tag else ""
-            title = re.sub(r"\s+", " ", raw_text).strip() or "Untitled"
+        blocks = soup.select("div.mozaique div.thumb-block")
 
-            # Extract details: views, rating, duration, quality
-            views = re.search(r"([\d\.]+[MK])", raw_text)
-            rating = re.search(r"(\d{1,3}%)", raw_text)
-            duration = re.search(r"(\d+:\d+)", raw_text)
-            quality = re.search(r"(\d+p)", raw_text)
+        for block in blocks:
+            try:
+                a_tag = block.select_one("a[href]")
+                img_tag = block.select_one("img")
 
-            thumb = img_tag.get("data-src") or img_tag.get("src") if img_tag else None
-            link = f"{base_url}{a_tag['href']}" if a_tag else None
+                # Title
+                title = "Untitled"
+                if img_tag:
+                    title = img_tag.get("alt") or "Untitled"
 
-            if link:
-                videos.append({
-                    "title": title,
-                    "url": link,
-                    "thumbnail": thumb,
-                    "views": views.group(1) if views else None,
-                    "rating": rating.group(1) if rating else None,
-                    "duration": duration.group(1) if duration else None,
-                    "quality": quality.group(1) if quality else None
-                })
+                # URL
+                link = None
+                if a_tag and a_tag.get("href"):
+                    link = base_url + a_tag.get("href")
+
+                # Thumbnail
+                thumb = None
+                if img_tag:
+                    thumb = img_tag.get("data-src") or img_tag.get("src")
+
+                # Duration
+                duration_tag = block.select_one(".duration")
+                duration = duration_tag.get_text(strip=True) if duration_tag else None
+
+                # Full text for parsing
+                text = block.get_text(" ", strip=True)
+
+                # Views
+                views_match = re.search(r"([\d\.]+[MK]?)\s*views", text, re.I)
+                views = views_match.group(1) if views_match else None
+
+                # Rating
+                rating_match = re.search(r"(\d{1,3}%)", text)
+                rating = rating_match.group(1) if rating_match else None
+
+                if link:
+                    videos.append({
+                        "title": title.strip(),
+                        "url": link,
+                        "thumbnail": thumb,
+                        "views": views,
+                        "rating": rating,
+                        "duration": duration
+                    })
+
+            except Exception:
+                continue  # skip broken blocks safely
 
         return JSONResponse(videos)
 
@@ -74,44 +104,50 @@ async def search(
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# =========================
+# 🎬 VIDEO DETAILS API
+# =========================
 @app.get("/api/video")
 async def get_video_details(
-    url: str = Query(..., description="Full video page URL")
+    url: str = Query(...)
 ):
-    """Extract HD and SD video URLs + metadata."""
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(url, headers=headers)
+            r = await client.get(url, headers=HEADERS)
+
         soup = BeautifulSoup(r.text, "html.parser")
 
-        video_hd, video_sd = None, None
-        title = soup.select_one("title")
-        title_text = title.text.strip() if title else "Unknown Title"
+        title = soup.title.string.strip() if soup.title else "Unknown Title"
 
-        # Find script tags containing URLs
-        for script in soup.find_all("script"):
+        video_hd = None
+        video_sd = None
+
+        scripts = soup.find_all("script")
+
+        for script in scripts:
             if not script.string:
                 continue
-            if "html5player.setVideoUrlHigh" in script.string:
-                match = re.search(r"html5player\.setVideoUrlHigh\('(.*?)'\)", script.string)
-                if match:
-                    video_hd = match.group(1)
-            if "html5player.setVideoUrlLow" in script.string:
-                match = re.search(r"html5player\.setVideoUrlLow\('(.*?)'\)", script.string)
-                if match:
-                    video_sd = match.group(1)
 
-        duration = None
-        dur_tag = soup.select_one(".duration")
-        if dur_tag:
-            duration = dur_tag.get_text(strip=True)
+            text = script.string
+
+            hd_match = re.search(r"setVideoUrlHigh\('(.*?)'\)", text)
+            sd_match = re.search(r"setVideoUrlLow\('(.*?)'\)", text)
+
+            if hd_match:
+                video_hd = hd_match.group(1)
+
+            if sd_match:
+                video_sd = sd_match.group(1)
+
+        # Duration
+        duration_tag = soup.select_one(".duration")
+        duration = duration_tag.get_text(strip=True) if duration_tag else None
 
         if not video_hd and not video_sd:
-            return JSONResponse({"error": "Video URLs not found"}, status_code=404)
+            return JSONResponse({"error": "Video not found"}, status_code=404)
 
         return JSONResponse({
-            "title": title_text,
+            "title": title,
             "duration": duration,
             "video_hd": video_hd,
             "video_sd": video_sd,
